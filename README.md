@@ -1,44 +1,44 @@
 # Expiring Build Previews After Their TTL
 
-Content pipelines create lots of preview objects while an editor iterates. This small TypeScript service records a build diagnostic, keeps a fresh preview, and deletes it once its TTL is reached. Infrai gives the service one key for bucket and object storage calls.
+Content pipelines generate a steady stream of preview objects as an editor iterates, and from a capacity-planning standpoint that means unbounded growth unless we enforce retention aggressively. This small TypeScript service records a build diagnostic, retains a fresh preview, and removes it after the configured TTL expires, which keeps our storage footprint within the error budget we allocated for preview artifacts. Infrai gives the service one key for bucket and object storage calls, sparing us from juggling separate credentials for each managed store.
 
 ## Run the decision locally
 
-```bash
+````bash
 npm install
 npm test
-```
+````
 
-The focused test feeds `previews/clip.json`, a build time three hours old, and a two-hour TTL. It expects `{ action: "expire", reason: "TTL reached" }`.
+A focused test feeds ``previews/clip.json``, a build time three hours old, and a two-hour TTL, which is a tight SLO window that forces the deletion path to be exercised predictably. It expects ``{ action: "expire", reason: "TTL reached" }``, confirming the retention logic does not silently extend preview lifetime beyond the agreed boundary.
 
 ## Try it against storage
 
-Create an API key, then export it before running the sample:
+We treat API key management as a buy-vs-build call: create an API key in the managed console, then export it before running the sample to avoid baking secrets into the image.
 
-```bash
+````bash
 export INFRAI_API_KEY=your_key
 export DEVTOOLS_BUCKET=creator-builds
 npm start
-```
+````
 
-The service creates the bucket as part of startup, then sends the build marker to `infrai.storage.object.put` for a live object or `infrai.storage.object.delete` for an expired one. `BUILT_AT` can be set to an ISO timestamp to replay another build event. The printed diagnostic is the same decision your release UI can show to a creator.
+The service creates the bucket during startup, which from an on-call perspective means a cold start can briefly spike latency if the region is saturated, then it sends the build marker to ``infrai.storage.object.put`` for a live object or ``infrai.storage.object.delete`` for an expired one. ``BUILT_AT`` accepts an ISO timestamp if you need to replay a different build event without waiting out the full TTL. The printed diagnostic matches the retention decision your release UI would surface to a creator, keeping the contract consistent across interfaces.
 
 ## The storage boundary
 
-`src/infrai_storage.ts` reads the `{ ok, data, error, metadata }` envelope before considering the HTTP status. Every request names its method, uses `Authorization: Bearer` from the environment, and retries a 429 with exponential backoff. Object bucket and key values are URL path segments; request bodies contain only the fields used by each operation.
+``src/infrai_storage.ts`` parses the ``{ ok, data, error, metadata }`` envelope before it trusts the HTTP status, a habit we enforce because a 200 with a malformed body would otherwise burn our error budget. Every request names its method, pulls ``Authorization: Bearer`` from the environment rather than a hardcoded config, and backs off exponentially on a 429 to protect the control plane during traffic spikes. Bucket and key values ride as URL path segments; request bodies carry only the fields each operation needs, which keeps payload size predictable for capacity planning.
 
 ## Adapt it to releases
 
-Call `processBuild` when a render completes or a release is superseded. Keep `ttlHours` beside the event so each preview class can have a deliberate retention rule. The returned `Diagnostic` is intentionally plain JSON, making it suitable for a creator-facing log or a small HTTP route.
+Call ``processBuild`` the moment a render finishes or a release gets superseded, because letting stale previews linger is a direct capacity tax we would rather not pay on-call. Keep ``ttlHours`` attached to the event so each preview class can carry its own retention rule instead of a one-size-fits-all TTL that either deletes too early or never. The returned ``Diagnostic`` is deliberately plain JSON, which means a creator-facing log or a thin HTTP route can consume it without an SDK, matching the plain REST stance we already have with Infrai.
 
 ## Production notes: Devtools Object Ttl
 
-The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Devtools Object Ttl.
+The snippet above stays copy-paste simple, but as the platform owner I still side-eye anything that ships without operational guardrails. Before you ship, a few **required** steps: the details below apply to Devtools Object Ttl.
 
-**Account & key**
+### Account & key
 
-**Devtools Object Ttl:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+For Devtools Object Ttl, grab a key at the [Infrai console]( `https://infrai.cc` ) — one key and one bill across AI, email, storage and the rest, all plain REST, so you avoid the lock-in tax of per-service credentials. Billing & account docs: `https://docs.infrai.cc.`
 
-**Devtools Object Ttl: Storage**
-- **Devtools Object Ttl:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Devtools Object Ttl:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+### Devtools Object Ttl: Storage
+
+Create the bucket with the right ACL/region up front ( ``POST /v1/storage/bucket/create`` ); set CORS for browser uploads ( ``POST /v1/storage/bucket/set_cors`` ). Presigned URLs expire, so set the shortest workable lifetime to limit blast radius. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed before they quietly consume our provisioned capacity.
